@@ -41,7 +41,6 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/queue.h>
-#include <sys/kthread.h>
 
 #include <vm/vm.h>
 #include <vm/vm_page.h>
@@ -69,9 +68,7 @@ struct vtballoon_softc {
 	struct virtqueue	*vtballoon_deflate_vq;
 	struct virtqueue	*vtballoon_stats_vq;
 
-	struct proc		*vtballoon_stats_proc;
-	struct kproc_desc	 vtballoon_stats_kp;
-	uint8_t			 vtballoon_run_stats;
+	struct thread		*vtballoon_stats_td;
 
 	uint32_t		 vtballoon_desired_npages;
 	uint32_t		 vtballoon_current_npages;
@@ -105,7 +102,7 @@ static void	vtballoon_vq_intr(void *);
 
 static size_t	vtballoon_update_stats(struct vtballoon_softc *);
 static void	vtballoon_stats(struct vtballoon_softc *);
-static void	vtballoon_stats_proc_main(void *xsc);
+static void	vtballoon_stats_thread(void *);
 
 static void	vtballoon_inflate(struct vtballoon_softc *, int);
 static void	vtballoon_deflate(struct vtballoon_softc *, int);
@@ -230,6 +227,16 @@ vtballoon_attach(device_t dev)
 		goto fail;
 	}
 
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
+		error = kthread_add(vtballoon_stats_thread, sc, NULL, &sc->vtballoon_stats_td,
+		    0, 0, "virtio_balloon_stats");
+		if (error) {
+			device_printf(dev, "cannot create balloon stats kthread\n");
+// XXX: do we have to stop the balloon thread?
+			goto fail;
+		}
+	}
+
 	virtqueue_enable_intr(sc->vtballoon_inflate_vq);
 	virtqueue_enable_intr(sc->vtballoon_deflate_vq);
 	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
@@ -250,19 +257,23 @@ vtballoon_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 
-	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
-		sc->vtballoon_run_stats = 0;
+	sc->vtballoon_flags |= VTBALLOON_FLAG_DETACH;
+
+	if (sc->vtballoon_stats_td != NULL) {
 		VTBALLOON_LOCK(sc);
+		wakeup_one(sc);  // XXX
+		msleep(sc->vtballoon_td, VTBALLOON_MTX(sc), 0, "vtbsth", 0);
 		while (!virtqueue_empty(sc->vtballoon_stats_vq)) {
 			//mtx_sleep(&sc->vtballoon_stats_vq, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
 		}
 		KASSERT(virtqueue_empty(sc->vtballoon_stats_vq), ("virtqueue not empty"));
 		VTBALLOON_UNLOCK(sc);
+
+		sc->vtballoon_stats_td = NULL;
 	}
 
 	if (sc->vtballoon_td != NULL) {
 		VTBALLOON_LOCK(sc);
-		sc->vtballoon_flags |= VTBALLOON_FLAG_DETACH;
 		wakeup_one(sc);
 		msleep(sc->vtballoon_td, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
 		VTBALLOON_UNLOCK(sc);
@@ -323,7 +334,7 @@ vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 {
 	device_t dev;
 	struct vq_alloc_info vq_info[3];
-	int nvqs, r;
+	int nvqs;
 
 	dev = sc->vtballoon_dev;
 	nvqs = 2;
@@ -340,15 +351,7 @@ vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 		++nvqs;
 	}
 
-	r = virtio_alloc_virtqueues(dev, nvqs, vq_info);
-
-	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
-		/* start the stats proc */
-		sc->vtballoon_run_stats = 1;
-		kproc_create(vtballoon_stats_proc_main, sc, &(sc->vtballoon_stats_proc), 0, 0, "%s_stats", device_get_nameunit(dev));
-	}
-
-	return r;
+	return virtio_alloc_virtqueues(dev, nvqs, vq_info);
 }
 
 static void
@@ -415,6 +418,8 @@ vtballoon_stats(struct vtballoon_softc *sc)
 	struct sglist sg;
 	struct sglist_seg segs[1];
 
+	device_printf(sc->vtballoon_dev, "running vtballoon_stats ...\n");
+
 	num_stats = vtballoon_update_stats(sc);
 
 	sglist_init(&sg, 1, segs);
@@ -424,19 +429,6 @@ vtballoon_stats(struct vtballoon_softc *sc)
 	error = virtqueue_enqueue(sc->vtballoon_stats_vq, sc->vtballoon_stats_vq, &sg, 1, 0);
 	virtqueue_notify(sc->vtballoon_stats_vq);
 }
-
-static void
-vtballoon_stats_proc_main(void *xsc) {
-	struct vtballoon_softc *sc = (struct vtballoon_softc *)xsc;
-
-	while (sc->vtballoon_run_stats) {
-		device_printf(sc->vtballoon_dev, "running vtballoon_stats ...\n");
-		vtballoon_stats(sc);
-		pause("vtballoon_stats", (3 * hz));
-	}
-	kproc_exit(0);
-}
-
 
 static void
 vtballoon_inflate(struct vtballoon_softc *sc, int npages)
@@ -668,6 +660,24 @@ vtballoon_thread(void *xsc)
 
 			vtballoon_update_size(sc);
 		}
+	}
+
+	kthread_exit();
+}
+
+static void
+vtballoon_stats_thread(void *xsc)
+{
+	struct vtballoon_softc *sc;
+
+	sc = xsc;
+
+	for (;;) {
+		if (vtballoon_sleep(sc) != 0)
+			break;
+
+		if (virtqueue_empty(sc->vtballoon_stats_vq))
+			vtballoon_stats(sc);
 	}
 
 	kthread_exit();
