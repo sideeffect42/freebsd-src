@@ -269,6 +269,10 @@ vtballoon_detach(device_t dev)
 		VTBALLOON_UNLOCK(sc);
 
 		sc->vtballoon_stats_td = NULL;
+
+		/* empty the queue */
+		while (!virtqueue_empty(sc->vtballoon_stats_vq))
+			(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
 	}
 
 	if (sc->vtballoon_td != NULL) {
@@ -688,8 +692,12 @@ vtballoon_stats_thread(void *xsc)
 		device_printf(sc->vtballoon_dev, "stats_vq: free_cnt = %d\n", virtqueue_nfree(sc->vtballoon_stats_vq));
 		device_printf(sc->vtballoon_dev, "stats_vq: empty    = %d\n", virtqueue_empty(sc->vtballoon_stats_vq));
 
-		if (virtqueue_dequeue(sc->vtballoon_stats_vq, NULL) != NULL)
+		if (virtqueue_dequeue(sc->vtballoon_stats_vq, NULL) != NULL) {
+			while (!virtqueue_empty(sc->vtballoon_stats_vq))
+				(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
+
 			vtballoon_stats(sc);
+		}
 
 		msleep(sc->vtballoon_stats_td, VTBALLOON_MTX(sc), 0, "vtbslp", 1000);
 	}
