@@ -1,7 +1,9 @@
+/* https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html */ 
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * Copyright (c) 2011, Bryan Venteicher <bryanv@FreeBSD.org>
+ * Copyright (c) 2026, Dennis Camera <dennis.camera+freebsd@riiengineering.ch>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -31,7 +33,6 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
-#include <sys/endian.h>
 #include <sys/kthread.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
@@ -40,6 +41,7 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/queue.h>
+#include <sys/kthread.h>
 
 #include <vm/vm.h>
 #include <vm/vm_page.h>
@@ -50,6 +52,7 @@
 #include <sys/rman.h>
 
 #include <dev/virtio/virtio.h>
+#include <dev/virtio/virtio_endian.h>
 #include <dev/virtio/virtqueue.h>
 #include <dev/virtio/balloon/virtio_balloon.h>
 
@@ -64,6 +67,11 @@ struct vtballoon_softc {
 
 	struct virtqueue	*vtballoon_inflate_vq;
 	struct virtqueue	*vtballoon_deflate_vq;
+	struct virtqueue	*vtballoon_stats_vq;
+
+	struct proc		*vtballoon_stats_proc;
+	struct kproc_desc	 vtballoon_stats_kp;
+	uint8_t			 vtballoon_run_stats;
 
 	uint32_t		 vtballoon_desired_npages;
 	uint32_t		 vtballoon_current_npages;
@@ -72,6 +80,8 @@ struct vtballoon_softc {
 	struct thread		*vtballoon_td;
 	uint32_t		*vtballoon_page_frames;
 	int			 vtballoon_timeout;
+
+	struct virtio_balloon_stat vtballoon_stats[VIRTIO_BALLOON_S_NR]; /* little endian */
 };
 
 static struct virtio_feature_desc vtballoon_feature_desc[] = {
@@ -92,6 +102,10 @@ static int	vtballoon_setup_features(struct vtballoon_softc *);
 static int	vtballoon_alloc_virtqueues(struct vtballoon_softc *);
 
 static void	vtballoon_vq_intr(void *);
+
+static size_t	vtballoon_update_stats(struct vtballoon_softc *);
+static void	vtballoon_stats(struct vtballoon_softc *);
+static void	vtballoon_stats_proc_main(void *xsc);
 
 static void	vtballoon_inflate(struct vtballoon_softc *, int);
 static void	vtballoon_deflate(struct vtballoon_softc *, int);
@@ -114,7 +128,7 @@ static void	vtballoon_setup_sysctl(struct vtballoon_softc *);
     (((_sc)->vtballoon_features & VIRTIO_F_VERSION_1) != 0)
 
 /* Features desired/implemented by this driver. */
-#define VTBALLOON_FEATURES		VIRTIO_BALLOON_F_MUST_TELL_HOST
+#define VTBALLOON_FEATURES		(VIRTIO_BALLOON_F_MUST_TELL_HOST | VIRTIO_BALLOON_F_STATS_VQ)
 
 /* Timeout between retries when the balloon needs inflating. */
 #define VTBALLOON_LOWMEM_TIMEOUT	hz
@@ -218,6 +232,9 @@ vtballoon_attach(device_t dev)
 
 	virtqueue_enable_intr(sc->vtballoon_inflate_vq);
 	virtqueue_enable_intr(sc->vtballoon_deflate_vq);
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
+		virtqueue_enable_intr(sc->vtballoon_stats_vq);
+	}
 
 fail:
 	if (error)
@@ -232,6 +249,16 @@ vtballoon_detach(device_t dev)
 	struct vtballoon_softc *sc;
 
 	sc = device_get_softc(dev);
+
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
+		sc->vtballoon_run_stats = 0;
+		VTBALLOON_LOCK(sc);
+		while (!virtqueue_empty(sc->vtballoon_stats_vq)) {
+			//mtx_sleep(&sc->vtballoon_stats_vq, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
+		}
+		KASSERT(virtqueue_empty(sc->vtballoon_stats_vq), ("virtqueue not empty"));
+		VTBALLOON_UNLOCK(sc);
+	}
 
 	if (sc->vtballoon_td != NULL) {
 		VTBALLOON_LOCK(sc);
@@ -288,21 +315,15 @@ vtballoon_negotiate_features(struct vtballoon_softc *sc)
 static int
 vtballoon_setup_features(struct vtballoon_softc *sc)
 {
-	int error;
-
-	error = vtballoon_negotiate_features(sc);
-	if (error)
-		return (error);
-
-	return (0);
+	return vtballoon_negotiate_features(sc);
 }
 
 static int
 vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 {
 	device_t dev;
-	struct vq_alloc_info vq_info[2];
-	int nvqs;
+	struct vq_alloc_info vq_info[3];
+	int nvqs, r;
 
 	dev = sc->vtballoon_dev;
 	nvqs = 2;
@@ -313,7 +334,21 @@ vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 	VQ_ALLOC_INFO_INIT(&vq_info[1], 0, vtballoon_vq_intr, sc,
 	    &sc->vtballoon_deflate_vq, "%s deflate", device_get_nameunit(dev));
 
-	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
+		VQ_ALLOC_INFO_INIT(&vq_info[2], 0, vtballoon_vq_intr, sc,
+		    &sc->vtballoon_stats_vq, "%s stats", device_get_nameunit(dev));
+		++nvqs;
+	}
+
+	r = virtio_alloc_virtqueues(dev, nvqs, vq_info);
+
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
+		/* start the stats proc */
+		sc->vtballoon_run_stats = 1;
+		kproc_create(vtballoon_stats_proc_main, sc, &(sc->vtballoon_stats_proc), 0, 0, "%s_stats", device_get_nameunit(dev));
+	}
+
+	return r;
 }
 
 static void
@@ -327,6 +362,81 @@ vtballoon_vq_intr(void *xsc)
 	wakeup_one(sc);
 	VTBALLOON_UNLOCK(sc);
 }
+
+
+static int _x = 2048;
+
+static size_t
+vtballoon_update_stats(struct vtballoon_softc *sc)
+{
+	int is_modern;
+	size_t i;
+
+	i = 0;
+	is_modern = vtballoon_modern(sc);
+
+#define vtballoon_put_stat(_tag, _val) \
+	sc->vtballoon_stats[i++] = (struct virtio_balloon_stat){.tag = virtio_gtoh16(is_modern, _tag), .val = virtio_gtoh64(is_modern, _val)}
+
+	/* Amount of memory swapped in */
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_SWAP_IN, 0);*/
+	/* Amount of memory swapped out */   
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_SWAP_OUT, 0);*/
+	/* Number of major faults */ 
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MAJFLT, 0);*/
+	/* Number of minor faults */    
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MINFLT, 0);*/
+	/* Total amount of free memory */       
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MEMFREE, 0);*/
+	/* Total amount of memory */
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MEMTOT, 0);*/
+	/* Available memory as in /proc */   
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_AVAIL, 0);*/
+	/* Disk caches */
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_CACHES, 0);*/
+
+	vtballoon_put_stat(VIRTIO_BALLOON_S_MEMTOT, (4000 * 1024 * 1024));
+	vtballoon_put_stat(VIRTIO_BALLOON_S_MEMFREE, (_x-- * 1024 * 1024));
+	vtballoon_put_stat(VIRTIO_BALLOON_S_AVAIL, ((_x/2) * 1024 * 1024));
+	vtballoon_put_stat(VIRTIO_BALLOON_S_CACHES, ((_x/2) * 1024 * 1024));
+
+	KASSERT(i < VIRTIO_BALLOON_S_NR, ("array overflow"));
+
+#undef vtballoon_put_stat
+
+	return i;
+}
+
+static void
+vtballoon_stats(struct vtballoon_softc *sc)
+{
+	int error __diagused;
+	size_t num_stats;
+	struct sglist sg;
+	struct sglist_seg segs[1];
+
+	num_stats = vtballoon_update_stats(sc);
+
+	sglist_init(&sg, 1, segs);
+	error = sglist_append(&sg, sc->vtballoon_stats, sizeof(sc->vtballoon_stats[0])*num_stats);
+	KASSERT(error == 0, ("error outputting stats buffer to virtqueue"));
+
+	error = virtqueue_enqueue(sc->vtballoon_stats_vq, sc->vtballoon_stats_vq, &sg, 1, 0);
+	virtqueue_notify(sc->vtballoon_stats_vq);
+}
+
+static void
+vtballoon_stats_proc_main(void *xsc) {
+	struct vtballoon_softc *sc = (struct vtballoon_softc *)xsc;
+
+	while (sc->vtballoon_run_stats) {
+		device_printf(sc->vtballoon_dev, "running vtballoon_stats ...\n");
+		vtballoon_stats(sc);
+		pause("vtballoon_stats", (3 * hz));
+	}
+	kproc_exit(0);
+}
+
 
 static void
 vtballoon_inflate(struct vtballoon_softc *sc, int npages)
@@ -446,6 +556,9 @@ vtballoon_stop(struct vtballoon_softc *sc)
 
 	virtqueue_disable_intr(sc->vtballoon_inflate_vq);
 	virtqueue_disable_intr(sc->vtballoon_deflate_vq);
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
+		virtqueue_disable_intr(sc->vtballoon_stats_vq);
+	}
 
 	virtio_stop(sc->vtballoon_dev);
 }
@@ -478,10 +591,7 @@ vtballoon_desired_size(struct vtballoon_softc *sc)
 	desired = virtio_read_dev_config_4(sc->vtballoon_dev,
 	    offsetof(struct virtio_balloon_config, num_pages));
 
-	if (vtballoon_modern(sc))
-		return (desired);
-	else
-		return (le32toh(desired));
+	return virtio_gtoh32(vtballoon_modern(sc), desired);
 }
 
 static void
@@ -489,9 +599,7 @@ vtballoon_update_size(struct vtballoon_softc *sc)
 {
 	uint32_t npages;
 
-	npages = sc->vtballoon_current_npages;
-	if (!vtballoon_modern(sc))
-		npages = htole32(npages);
+	npages = virtio_gtoh32(vtballoon_modern(sc), sc->vtballoon_current_npages);
 
 	virtio_write_dev_config_4(sc->vtballoon_dev,
 	    offsetof(struct virtio_balloon_config, actual), npages);
