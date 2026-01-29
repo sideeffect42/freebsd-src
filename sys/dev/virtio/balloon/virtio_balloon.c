@@ -384,22 +384,26 @@ vtballoon_update_stats(struct vtballoon_softc *sc)
 #define vtballoon_put_stat(_tag, _val) \
 	sc->vtballoon_stats[i++] = (struct virtio_balloon_stat){.tag = virtio_gtoh16(is_modern, _tag), .val = virtio_gtoh64(is_modern, _val)}
 
-	/* Amount of memory swapped in */
+	/* The amount of memory that has been swapped in (in bytes) */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_SWAP_IN, 0);*/
-	/* Amount of memory swapped out */   
+	/* The amount of memory that has been swapped out to disk (in bytes) */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_SWAP_OUT, 0);*/
-	/* Number of major faults */ 
+	/* The number of major page faults that have occurred */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MAJFLT, 0);*/
-	/* Number of minor faults */    
+	/* The number of minor page faults that have occurred */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MINFLT, 0);*/
-	/* Total amount of free memory */       
+	/* The amount of memory not being used for any purpose (in bytes) */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MEMFREE, 0);*/
-	/* Total amount of memory */
+	/* The total amount of memory available (in bytes) */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_MEMTOT, 0);*/
-	/* Available memory as in /proc */   
+	/* An estimate of how much memory is available (in bytes) for starting new applications, without pushing the system to swap */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_AVAIL, 0);*/
-	/* Disk caches */
+	/* The amount of memory, in bytes, that can be quickly reclaimed without additional I/O. Typically these pages are used for caching files from disk */
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_CACHES, 0);*/
+	/* The number of successful hugetlb page allocations in the guest */
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_HTLB_PGALLOC, 0);*/
+	/* The number of failed hugetlb page allocations in the guest */
+	/*vtballoon_put_stat(VIRTIO_BALLOON_S_HTLB_PGFAIL, 0);*/
 
 	vtballoon_put_stat(VIRTIO_BALLOON_S_MEMTOT, (4000 * 1024 * 1024));
 	vtballoon_put_stat(VIRTIO_BALLOON_S_MEMFREE, (_x-- * 64 * 1024 * 1024));
