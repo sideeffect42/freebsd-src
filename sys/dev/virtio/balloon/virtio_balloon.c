@@ -229,6 +229,9 @@ vtballoon_attach(device_t dev)
 	}
 
 	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
+		// initial buffer
+		vtballoon_stats(sc);
+
 		error = kthread_add(vtballoon_stats_thread, sc, NULL, &sc->vtballoon_stats_td,
 		    0, 0, "virtio_balloon_stats");
 		if (error) {
@@ -363,7 +366,7 @@ vtballoon_vq_intr(void *xsc)
 }
 
 
-static int _x = 2048;
+static int _x = (2048/64);
 
 static size_t
 vtballoon_update_stats(struct vtballoon_softc *sc)
@@ -395,9 +398,9 @@ vtballoon_update_stats(struct vtballoon_softc *sc)
 	/*vtballoon_put_stat(VIRTIO_BALLOON_S_CACHES, 0);*/
 
 	vtballoon_put_stat(VIRTIO_BALLOON_S_MEMTOT, (4000 * 1024 * 1024));
-	vtballoon_put_stat(VIRTIO_BALLOON_S_MEMFREE, (_x-- * 1024 * 1024));
-	vtballoon_put_stat(VIRTIO_BALLOON_S_AVAIL, ((_x/2) * 1024 * 1024));
-	vtballoon_put_stat(VIRTIO_BALLOON_S_CACHES, ((_x/2) * 1024 * 1024));
+	vtballoon_put_stat(VIRTIO_BALLOON_S_MEMFREE, (_x-- * 64 * 1024 * 1024));
+	vtballoon_put_stat(VIRTIO_BALLOON_S_AVAIL, ((_x/2) * 64 * 1024 * 1024));
+	vtballoon_put_stat(VIRTIO_BALLOON_S_CACHES, ((_x/2) * 64 * 1024 * 1024));
 
 	KASSERT(i < VIRTIO_BALLOON_S_NR, ("array overflow"));
 
@@ -421,8 +424,12 @@ vtballoon_stats(struct vtballoon_softc *sc)
 	sglist_init(&sg, 1, segs);
 	error = sglist_append(&sg, sc->vtballoon_stats, sizeof(sc->vtballoon_stats[0])*num_stats);
 	KASSERT(error == 0, ("error outputting stats buffer to virtqueue"));
+	if (error != 0) return;
 
 	error = virtqueue_enqueue(sc->vtballoon_stats_vq, sc->vtballoon_stats_vq, &sg, 1, 0);
+	KASSERT(error == 0, ("error enqueuing memory stats to virtqueue"));
+	if (error != 0) return;
+
 	virtqueue_notify(sc->vtballoon_stats_vq);
 }
 
@@ -513,9 +520,11 @@ vtballoon_send_page_frames(struct vtballoon_softc *sc, struct virtqueue *vq,
 	error = sglist_append(&sg, sc->vtballoon_page_frames,
 	    npages * sizeof(uint32_t));
 	KASSERT(error == 0, ("error adding page frames to sglist"));
+	if (error != 0) return;
 
 	error = virtqueue_enqueue(vq, vq, &sg, 1, 0);
 	KASSERT(error == 0, ("error enqueuing page frames to virtqueue"));
+	if (error != 0) return;
 	virtqueue_notify(vq);
 
 	/*
@@ -679,12 +688,8 @@ vtballoon_stats_thread(void *xsc)
 		device_printf(sc->vtballoon_dev, "stats_vq: free_cnt = %d\n", virtqueue_nfree(sc->vtballoon_stats_vq));
 		device_printf(sc->vtballoon_dev, "stats_vq: empty    = %d\n", virtqueue_empty(sc->vtballoon_stats_vq));
 
-		if (virtqueue_empty(sc->vtballoon_stats_vq))
+		if (virtqueue_dequeue(sc->vtballoon_stats_vq, NULL) != NULL)
 			vtballoon_stats(sc);
-		else {
-			device_printf(sc->vtballoon_dev, "notifying stats queue ...\n");
-			virtqueue_notify(sc->vtballoon_stats_vq);
-		}
 
 		msleep(sc->vtballoon_stats_td, VTBALLOON_MTX(sc), 0, "vtbslp", 1000);
 	}
