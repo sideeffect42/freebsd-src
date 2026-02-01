@@ -281,7 +281,7 @@ vtballoon_detach(device_t dev)
 	if (sc->vtballoon_td != NULL) {
 		VTBALLOON_LOCK(sc);
 		wakeup_one(sc);
-		msleep(sc, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
+		msleep(sc->vtballoon_td, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
 		VTBALLOON_UNLOCK(sc);
 
 		sc->vtballoon_td = NULL;
@@ -332,7 +332,7 @@ vtballoon_negotiate_features(struct vtballoon_softc *sc)
 static int
 vtballoon_setup_features(struct vtballoon_softc *sc)
 {
-	return vtballoon_negotiate_features(sc);
+	return (vtballoon_negotiate_features(sc));
 }
 
 static int
@@ -357,7 +357,7 @@ vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 		++nvqs;
 	}
 
-	return virtio_alloc_virtqueues(dev, nvqs, vq_info);
+	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
 }
 
 static void
@@ -629,7 +629,7 @@ vtballoon_desired_size(struct vtballoon_softc *sc)
 	desired = virtio_read_dev_config_4(sc->vtballoon_dev,
 	    offsetof(struct virtio_balloon_config, num_pages));
 
-	return virtio_gtoh32(vtballoon_modern(sc), desired);
+	return (virtio_gtoh32(vtballoon_modern(sc), desired));
 }
 
 static void
