@@ -1,4 +1,4 @@
-/* https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html */ 
+/* https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html */
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
@@ -641,7 +641,11 @@ vtballoon_desired_size(struct vtballoon_softc *sc)
 	desired = virtio_read_dev_config_4(sc->vtballoon_dev,
 	    offsetof(struct virtio_balloon_config, num_pages));
 
-	return (virtio_gtoh32(vtballoon_modern(sc), desired));
+	//return (virtio_gtoh32(vtballoon_modern(sc), desired));
+	if (vtballoon_modern(sc))
+		return (desired);
+	else
+		return (le32toh(desired));
 }
 
 static void
@@ -649,7 +653,10 @@ vtballoon_update_size(struct vtballoon_softc *sc)
 {
 	uint32_t npages;
 
-	npages = virtio_gtoh32(vtballoon_modern(sc), sc->vtballoon_current_npages);
+	//npages = virtio_gtoh32(vtballoon_modern(sc), sc->vtballoon_current_npages);
+	npages = sc->vtballoon_current_npages;
+	if (!vtballoon_modern(sc))
+		npages = htole32(npages);
 
 	virtio_write_dev_config_4(sc->vtballoon_dev,
 	    offsetof(struct virtio_balloon_config, actual), npages);
