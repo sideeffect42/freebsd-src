@@ -271,14 +271,14 @@ vtballoon_detach(device_t dev)
 		wakeup_one(sc->vtballoon_stats);
 		device_printf(dev, "sleeping on stats thread...\n");
 		msleep(sc->vtballoon_stats, VTBALLOON_MTX(sc), 0, "vtbsth", 0);
-		VTBALLOON_UNLOCK(sc);
-		device_printf(dev, "terminated stats thread\n");
-
-		sc->vtballoon_stats_td = NULL;
 
 		/* empty the queue */
 		/*while (!virtqueue_empty(sc->vtballoon_stats_vq))
 			(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);*/
+		VTBALLOON_UNLOCK(sc);
+		device_printf(dev, "terminated stats thread\n");
+
+		sc->vtballoon_stats_td = NULL;
 	}
 
 	if (sc->vtballoon_td != NULL) {
@@ -286,8 +286,8 @@ vtballoon_detach(device_t dev)
 		VTBALLOON_LOCK(sc);
 		device_printf(dev, "waking up balloon thread...\n");
 		wakeup_one(sc);
-		device_printf(dev, "sleeping on balloon thread...\n");
-		msleep(sc, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
+		//device_printf(dev, "sleeping on balloon thread...\n");
+		//msleep(sc->vtballoon_td, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
 		VTBALLOON_UNLOCK(sc);
 		device_printf(dev, "terminated balloon thread\n");
 
@@ -474,11 +474,11 @@ vtballoon_send_stats(struct vtballoon_softc *sc)
 	sglist_init(&sg, 1, segs);
 	error = sglist_append(&sg, sc->vtballoon_stats, sizeof(sc->vtballoon_stats[0])*num_stats);
 	KASSERT(error == 0, ("error outputting stats buffer to virtqueue"));
-	if (error != 0) return error;
+	//if (error != 0) return error;
 
 	error = virtqueue_enqueue(sc->vtballoon_stats_vq, sc->vtballoon_stats_vq, &sg, 1, 0);
 	KASSERT(error == 0, ("error enqueuing memory stats to virtqueue"));
-	if (error != 0) return error;
+	//if (error != 0) return error;
 
 	virtqueue_notify(sc->vtballoon_stats_vq);
 
@@ -584,10 +584,8 @@ vtballoon_send_page_frames(struct vtballoon_softc *sc, struct virtqueue *vq,
 	 * interrupt handler will wake us up.
 	 */
 	VTBALLOON_LOCK(sc);
-	device_printf(sc->vtballoon_dev, "in send_page_frames dequeue loop...\n");
 	while ((c = virtqueue_dequeue(vq, NULL)) == NULL)
 		msleep(sc, VTBALLOON_MTX(sc), 0, "vtbspf", 0);
-	device_printf(sc->vtballoon_dev, "end\n");
 	VTBALLOON_UNLOCK(sc);
 
 	KASSERT(c == vq, ("unexpected balloon operation response"));
