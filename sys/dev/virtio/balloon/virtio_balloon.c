@@ -70,8 +70,6 @@ struct vtballoon_softc {
 	struct virtqueue	*vtballoon_deflate_vq;
 	struct virtqueue	*vtballoon_stats_vq;
 
-	struct thread		*vtballoon_stats_td;
-
 	uint32_t		 vtballoon_desired_npages;
 	uint32_t		 vtballoon_current_npages;
 	TAILQ_HEAD(,vm_page)	 vtballoon_pages;
@@ -80,6 +78,7 @@ struct vtballoon_softc {
 	uint32_t		*vtballoon_page_frames;
 	int			 vtballoon_timeout;
 
+	struct thread		*vtballoon_stats_td;
 	struct virtio_balloon_stat vtballoon_stats[VIRTIO_BALLOON_S_NR]; /* little endian */
 };
 
@@ -266,39 +265,50 @@ vtballoon_detach(device_t dev)
 	sc->vtballoon_flags |= VTBALLOON_FLAG_DETACH;
 
 	if (sc->vtballoon_stats_td != NULL) {
+		device_printf(dev, "have to terminate stats thread...\n");
 		VTBALLOON_LOCK(sc);
+		device_printf(dev, "waking up stats thread...\n");
 		wakeup_one(sc->vtballoon_stats);
+		device_printf(dev, "sleeping on stats thread...\n");
 		msleep(sc->vtballoon_stats, VTBALLOON_MTX(sc), 0, "vtbsth", 0);
 		VTBALLOON_UNLOCK(sc);
+		device_printf(dev, "terminated stats thread\n");
 
 		sc->vtballoon_stats_td = NULL;
 
 		/* empty the queue */
-		while (!virtqueue_empty(sc->vtballoon_stats_vq))
-			(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
+		/*while (!virtqueue_empty(sc->vtballoon_stats_vq))
+			(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);*/
 	}
 
 	if (sc->vtballoon_td != NULL) {
+		device_printf(dev, "have to terminate balloon thread...\n");
 		VTBALLOON_LOCK(sc);
+		device_printf(dev, "waking up balloon thread...\n");
 		wakeup_one(sc);
-		msleep(sc->vtballoon_td, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
+		device_printf(dev, "sleeping on balloon thread...\n");
+		msleep(sc, VTBALLOON_MTX(sc), 0, "vtbdth", 0);
 		VTBALLOON_UNLOCK(sc);
+		device_printf(dev, "terminated balloon thread\n");
 
 		sc->vtballoon_td = NULL;
 	}
 
 	if (device_is_attached(dev)) {
+		device_printf(dev, "stopping vtballoon...\n");
 		vtballoon_pop(sc);
 		vtballoon_stop(sc);
 	}
 
 	if (sc->vtballoon_page_frames != NULL) {
+		device_printf(dev, "freeing page frames...\n");
 		free(sc->vtballoon_page_frames, M_DEVBUF);
 		sc->vtballoon_page_frames = NULL;
 	}
 
 	VTBALLOON_LOCK_DESTROY(sc);
 
+	device_printf(dev, "bye...\n");
 	return (0);
 }
 
@@ -574,8 +584,10 @@ vtballoon_send_page_frames(struct vtballoon_softc *sc, struct virtqueue *vq,
 	 * interrupt handler will wake us up.
 	 */
 	VTBALLOON_LOCK(sc);
+	device_printf(sc->vtballoon_dev, "in send_page_frames dequeue loop...\n");
 	while ((c = virtqueue_dequeue(vq, NULL)) == NULL)
 		msleep(sc, VTBALLOON_MTX(sc), 0, "vtbspf", 0);
+	device_printf(sc->vtballoon_dev, "end\n");
 	VTBALLOON_UNLOCK(sc);
 
 	KASSERT(c == vq, ("unexpected balloon operation response"));
@@ -722,13 +734,16 @@ vtballoon_stats_thread(void *xsc)
 	device_printf(sc->vtballoon_dev, "starting vtballoon_stats thread ...\n");
 	VTBALLOON_LOCK(sc);
 	for (;;) {
-		if (sc->vtballoon_flags & VTBALLOON_FLAG_DETACH)
+		if (sc->vtballoon_flags & VTBALLOON_FLAG_DETACH) {
+			device_printf(sc->vtballoon_dev, "ending vtballoon_stats thread ...\n");
 			break;
+		}
 
 		device_printf(sc->vtballoon_dev, "stats_vq: nentries = %3d, free_cnt = %3d, empty = %d\n", virtqueue_size(sc->vtballoon_stats_vq), virtqueue_nfree(sc->vtballoon_stats_vq), virtqueue_empty(sc->vtballoon_stats_vq));
 
-		if (!virtqueue_empty(sc->vtballoon_stats_vq)) {
-			(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
+		//if (!virtqueue_empty(sc->vtballoon_stats_vq)) {
+		//	(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
+		if (virtqueue_dequeue(sc->vtballoon_stats_vq, NULL) != NULL) {
 			/*do {
 				(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
 			} while (!virtqueue_empty(sc->vtballoon_stats_vq));*/
@@ -740,7 +755,7 @@ vtballoon_stats_thread(void *xsc)
 	}
 	VTBALLOON_UNLOCK(sc);
 
-	device_printf(sc->vtballoon_dev, "ending vtballoon_stats thread ...\n");
+	device_printf(sc->vtballoon_dev, "ended vtballoon_stats thread ...\n");
 
 	kthread_exit();
 }
