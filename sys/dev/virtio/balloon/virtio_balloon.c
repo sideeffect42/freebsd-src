@@ -272,11 +272,8 @@ vtballoon_detach(device_t dev)
 		device_printf(dev, "sleeping on stats thread...\n");
 		msleep(sc->vtballoon_stats, VTBALLOON_MTX(sc), 0, "vtbsth", 0);
 
-		/* empty the queue */
-		/*while (!virtqueue_empty(sc->vtballoon_stats_vq))
-			(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);*/
-		VTBALLOON_UNLOCK(sc);
 		device_printf(dev, "terminated stats thread\n");
+		VTBALLOON_UNLOCK(sc);
 
 		sc->vtballoon_stats_td = NULL;
 	}
@@ -389,6 +386,8 @@ vtballoon_stats_vq_intr(void *xsc)
 
 	sc = xsc;
 
+	device_printf(sc->vtballoon_dev, "stats interrupt received\n");
+	return;
 	VTBALLOON_LOCK(sc);
 	wakeup_one(sc->vtballoon_stats);
 	VTBALLOON_UNLOCK(sc);
@@ -474,11 +473,11 @@ vtballoon_send_stats(struct vtballoon_softc *sc)
 	sglist_init(&sg, 1, segs);
 	error = sglist_append(&sg, sc->vtballoon_stats, sizeof(sc->vtballoon_stats[0])*num_stats);
 	KASSERT(error == 0, ("error outputting stats buffer to virtqueue"));
-	//if (error != 0) return error;
+	if (error != 0) return error;
 
 	error = virtqueue_enqueue(sc->vtballoon_stats_vq, sc->vtballoon_stats_vq, &sg, 1, 0);
 	KASSERT(error == 0, ("error enqueuing memory stats to virtqueue"));
-	//if (error != 0) return error;
+	if (error != 0) return error;
 
 	virtqueue_notify(sc->vtballoon_stats_vq);
 
@@ -746,17 +745,19 @@ vtballoon_stats_thread(void *xsc)
 
 		device_printf(sc->vtballoon_dev, "stats_vq: nentries = %3d, free_cnt = %3d, empty = %d\n", virtqueue_size(sc->vtballoon_stats_vq), virtqueue_nfree(sc->vtballoon_stats_vq), virtqueue_empty(sc->vtballoon_stats_vq));
 
+		void *cookie = virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
+		if (cookie) cookie = NULL;
 		//if (!virtqueue_empty(sc->vtballoon_stats_vq)) {
-		//	(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
-		if (virtqueue_dequeue(sc->vtballoon_stats_vq, NULL) != NULL) {
-			/*do {
-				(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
-			} while (!virtqueue_empty(sc->vtballoon_stats_vq));*/
+			//do {
+			//	(void)virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
+			//} while (!virtqueue_empty(sc->vtballoon_stats_vq));
 
 			vtballoon_send_stats(sc);
-		}
+		//}
 
-		msleep(sc->vtballoon_stats, VTBALLOON_MTX(sc), 0, "vtbsts", 10000);
+		device_printf(sc->vtballoon_dev, "before vtballoon_stats sleep ...\n");
+		msleep(sc->vtballoon_stats, VTBALLOON_MTX(sc), 0, "vtbsts", 1000);
+		device_printf(sc->vtballoon_dev, "after vtballoon_stats sleep ...\n");
 	}
 	VTBALLOON_UNLOCK(sc);
 
