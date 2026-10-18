@@ -70,6 +70,8 @@ struct vtballoon_softc {
 	struct virtqueue	*vtballoon_inflate_vq;
 	struct virtqueue	*vtballoon_deflate_vq;
 	struct virtqueue	*vtballoon_stats_vq;
+	struct virtqueue	*vtballoon_free_page_vq;
+	struct virtqueue	*vtballoon_reporting_vq;
 
 	struct taskqueue        *vtballoon_tq;
 	struct task              vtballoon_stats_task;
@@ -89,6 +91,9 @@ static struct virtio_feature_desc vtballoon_feature_desc[] = {
 	{ VIRTIO_BALLOON_F_MUST_TELL_HOST,	"MustTellHost"	},
 	{ VIRTIO_BALLOON_F_STATS_VQ,		"StatsVq"	},
 	{ VIRTIO_BALLOON_F_DEFLATE_ON_OOM,	"DeflateOnOOM"	},
+	{ VIRTIO_BALLOON_F_PAGE_POISON,         "PagePoison"    },
+	{ VIRTIO_BALLOON_F_PAGE_REPORTING,      "PageReporting" },
+	{ VIRTIO_BALLOON_F_FREE_PAGE_HINT,      "FreePageHint"  },
 
 	{ 0, NULL }
 };
@@ -388,7 +393,7 @@ static int
 vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 {
 	device_t dev;
-	struct vq_alloc_info vq_info[3];
+	struct vq_alloc_info vq_info[5];
 	int nvqs;
 
 	dev = sc->vtballoon_dev;
@@ -401,9 +406,18 @@ vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 	    &sc->vtballoon_deflate_vq, "%s deflate", device_get_nameunit(dev));
 
 	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
-		VQ_ALLOC_INFO_INIT(&vq_info[2], 0, vtballoon_stats_vq_intr, sc,
+		VQ_ALLOC_INFO_INIT(&vq_info[nvqs++], 0, vtballoon_stats_vq_intr, sc,
 		    &sc->vtballoon_stats_vq, "%s stats", device_get_nameunit(dev));
-		++nvqs;
+	}
+
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_FREE_PAGE_HINT) != 0) {
+		VQ_ALLOC_INFO_INIT(&vq_info[nvqs++], 0, vtballoon_vq_intr, sc,
+		    &sc->vtballoon_free_page_vq, "%s free page", device_get_nameunit(dev));
+	}
+
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_PAGE_REPORTING) != 0) {
+		VQ_ALLOC_INFO_INIT(&vq_info[nvqs++], 0, vtballoon_vq_intr, sc,
+		    &sc->vtballoon_reporting_vq, "%s reporting", device_get_nameunit(dev));
 	}
 
 	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
@@ -496,8 +510,6 @@ vtballoon_send_stats(struct vtballoon_softc *sc)
 	size_t num_stats;
 	struct sglist sg;
 	struct sglist_seg segs[1];
-
-	device_printf(sc->vtballoon_dev, "running vtballoon_stats ...\n");
 
 	num_stats = vtballoon_update_stats(sc);
 
@@ -636,6 +648,12 @@ vtballoon_stop(struct vtballoon_softc *sc)
 	virtqueue_disable_intr(sc->vtballoon_deflate_vq);
 	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
 		virtqueue_disable_intr(sc->vtballoon_stats_vq);
+	}
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_FREE_PAGE_HINT) != 0) {
+		virtqueue_disable_intr(sc->vtballoon_free_page_vq);
+	}
+	if ((sc->vtballoon_features & VIRTIO_BALLOON_F_PAGE_REPORTING) != 0) {
+		virtqueue_disable_intr(sc->vtballoon_reporting_vq);
 	}
 
 	virtio_stop(sc->vtballoon_dev);
