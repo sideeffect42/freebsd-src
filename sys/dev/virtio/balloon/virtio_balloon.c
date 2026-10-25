@@ -33,6 +33,7 @@
 //  - mutex, locks, stuff
 //  - huge table stats?
 //  - multiple interrupts
+//  - htop reports incorrect total memory when ballooning
 
 /* Driver for VirtIO memory balloon devices. */
 
@@ -128,7 +129,9 @@ static int	vtballoon_negotiate_features(struct vtballoon_softc *);
 static int	vtballoon_setup_features(struct vtballoon_softc *);
 static int	vtballoon_alloc_virtqueues(struct vtballoon_softc *);
 
-static void	vtballoon_vq_intr(void *);
+static void	vtballoon_inflate_vq_intr(void *);
+static void	vtballoon_deflate_vq_intr(void *);
+static void	vtballoon_stats_vq_intr(void *);
 
 static void	vtballoon_configchanged_task(void *, int);
 
@@ -448,24 +451,25 @@ static void
 vtballoon_stats_request_task(void *xsc, int pending __unused)
 {
 	struct vtballoon_softc *sc;
-	//void *c;
+	void *c;
 
 	sc = xsc;
-	
+
 	if (VTBALLOON_TEST_FLAG(sc, VTBALLOON_FLAG_DETACH)) {
 		return;
 	}
 
 	VTBALLOON_LOCK(sc);
 
-	//if ((c = virtqueue_dequeue(sc->vtballoon_stats_vq, NULL)) == NULL) {
-	//	VTBALLOON_UNLOCK(sc);
-	//	return;
-	//}
-	//KASSERT(c == sc->vtballoon_stats_vq, ("unexpected balloon operation response"));
+	c = virtqueue_dequeue(sc->vtballoon_stats_vq, NULL);
+	if (c == NULL) {
+		goto ret;
+	}
+	KASSERT(c == sc->vtballoon_stats_vq, ("unexpected balloon operation response"));
 
 	(void)vtballoon_send_stats(sc);
 
+ret:
 	VTBALLOON_UNLOCK(sc);
 }
 
@@ -500,18 +504,19 @@ vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 	features = sc->vtballoon_features;
 	nvqs = 2;
 
-	VQ_ALLOC_INFO_INIT(&vq_info[0], 0, vtballoon_vq_intr, sc,
+	VQ_ALLOC_INFO_INIT(&vq_info[0], 0, vtballoon_inflate_vq_intr, sc,
 	    &sc->vtballoon_inflate_vq, "%s inflate", device_get_nameunit(dev));
 
-	VQ_ALLOC_INFO_INIT(&vq_info[1], 0, vtballoon_vq_intr, sc,
+	VQ_ALLOC_INFO_INIT(&vq_info[1], 0, vtballoon_deflate_vq_intr, sc,
 	    &sc->vtballoon_deflate_vq, "%s deflate", device_get_nameunit(dev));
 
 	if ((features & VIRTIO_BALLOON_F_STATS_VQ) != 0) {
-		VQ_ALLOC_INFO_INIT(&vq_info[2], 0, vtballoon_vq_intr, sc,
+		VQ_ALLOC_INFO_INIT(&vq_info[2], 0, vtballoon_stats_vq_intr, sc,
 		    &sc->vtballoon_stats_vq, "%s stats", device_get_nameunit(dev));
 		nvqs = 3;
 	}
 
+/*
 	if ((features & VIRTIO_BALLOON_F_FREE_PAGE_HINT) != 0) {
 		VQ_ALLOC_INFO_INIT(&vq_info[3], 0, vtballoon_vq_intr, sc,
 		    &sc->vtballoon_free_page_vq, "%s free page", device_get_nameunit(dev));
@@ -523,51 +528,63 @@ vtballoon_alloc_virtqueues(struct vtballoon_softc *sc)
 		    &sc->vtballoon_reporting_vq, "%s reporting", device_get_nameunit(dev));
 		nvqs = 5;
 	}
+*/
 
 	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
 }
 
 static void
-vtballoon_vq_intr(void *xsc)
+vtballoon_inflate_vq_intr(void *xsc)
 {
 	struct vtballoon_softc *sc;
-	uint64_t features;
-	void *c;
 
 	sc = xsc;
-	features = atomic_load_64(&sc->vtballoon_features);
 
-	VTBALLOON_LOCK(sc);
-device_printf(sc->vtballoon_dev, "intr\n");
+//	VTBALLOON_LOCK(sc);
+device_printf(sc->vtballoon_dev, "intr i\n");
 
 	if (!virtqueue_empty(sc->vtballoon_inflate_vq)) {
 device_printf(sc->vtballoon_dev, "..inflate\n");
 		taskqueue_enqueue(taskqueue_thread, &sc->vtballoon_inflate_response_task);
 	}
 
+//	VTBALLOON_UNLOCK(sc);
+}
+
+static void
+vtballoon_deflate_vq_intr(void *xsc)
+{
+	struct vtballoon_softc *sc;
+
+	sc = xsc;
+
+//	VTBALLOON_LOCK(sc);
+device_printf(sc->vtballoon_dev, "intr d\n");
+
 	if (!virtqueue_empty(sc->vtballoon_deflate_vq)) {
 device_printf(sc->vtballoon_dev, "..deflate\n");
 		taskqueue_enqueue(taskqueue_thread, &sc->vtballoon_deflate_response_task);
 	}
 
-	if ((features & VIRTIO_BALLOON_F_STATS_VQ) != 0 && !virtqueue_empty(sc->vtballoon_stats_vq)) {
+//	VTBALLOON_UNLOCK(sc);
+}
+
+static void
+vtballoon_stats_vq_intr(void *xsc)
+{
+	struct vtballoon_softc *sc;
+
+	sc = xsc;
+
+//	VTBALLOON_LOCK(sc);
+device_printf(sc->vtballoon_dev, "intr s\n");
+
+	if (!virtqueue_empty(sc->vtballoon_stats_vq)) {
 device_printf(sc->vtballoon_dev, "..stats\n");
-
-		if ((c = virtqueue_dequeue(sc->vtballoon_stats_vq, NULL)) != NULL) {
-			KASSERT(c == sc->vtballoon_stats_vq, ("unexpected balloon operation response"));
-			taskqueue_enqueue(taskqueue_thread, &sc->vtballoon_stats_request_task);
-		}
+		taskqueue_enqueue(taskqueue_thread, &sc->vtballoon_stats_request_task);
 	}
 
-	if ((features & VIRTIO_BALLOON_F_FREE_PAGE_HINT) != 0 && !virtqueue_empty(sc->vtballoon_free_page_vq)) {
-		//taskqueue_enqueue(taskqueue_thread, &sc->vtballoon_free_page_task);
-	}
-
-	if ((features & VIRTIO_BALLOON_F_PAGE_REPORTING) != 0 && !virtqueue_empty(sc->vtballoon_reporting_vq)) {
-		//taskqueue_enqueue(taskqueue_thread, &sc->vtballoon_reporting_task);
-	}
-
-	VTBALLOON_UNLOCK(sc);
+//	VTBALLOON_UNLOCK(sc);
 }
 
 static size_t
@@ -641,11 +658,9 @@ vtballoon_send_stats(struct vtballoon_softc *sc)
 
 	sglist_init(&sg, 1, segs);
 	error = sglist_append(&sg, sc->vtballoon_stats, sizeof(sc->vtballoon_stats[0])*num_stats);
-	KASSERT(error == 0, ("error outputting stats buffer to virtqueue"));
 	if (error != 0) return (error);
 
 	error = virtqueue_enqueue(sc->vtballoon_stats_vq, sc->vtballoon_stats_vq, &sg, 1, 0);
-	KASSERT(error == 0, ("error enqueuing memory stats to virtqueue"));
 	if (error != 0) return (error);
 
 	virtqueue_notify(sc->vtballoon_stats_vq);
@@ -760,20 +775,22 @@ vtballoon_inflate_response_task(void *xsc, int pending __unused)
 	VTBALLOON_LOCK(sc);
 
 	c = virtqueue_dequeue(sc->vtballoon_inflate_vq, NULL);
-device_printf(sc->vtballoon_dev, "inflate cookie: %p\n", c);
-	if (c != NULL) {
-		if (c->buf != NULL) {
-			free(c->buf, M_DEVBUF);
-		}
-		free(c, M_DEVBUF);
-
-		vtballoon_write_current_npages(sc);
-
-		if (!VTBALLOON_TEST_FLAG(sc, VTBALLOON_FLAG_DETACH)) {
-			vtballoon_adjust_size(sc);
-		}
+	if (c == NULL) {
+		goto ret;
 	}
 
+	if (c->buf != NULL) {
+		free(c->buf, M_DEVBUF);
+	}
+	free(c, M_DEVBUF);
+
+	vtballoon_write_current_npages(sc);
+
+	if (!VTBALLOON_TEST_FLAG(sc, VTBALLOON_FLAG_DETACH)) {
+		vtballoon_adjust_size(sc);
+	}
+
+ret:
 	VTBALLOON_UNLOCK(sc);
 }
 
@@ -843,7 +860,8 @@ vtballoon_deflate_response_task(void *xsc, int pending __unused)
 
 	VTBALLOON_LOCK(sc);
 
-	if ((c = virtqueue_dequeue(sc->vtballoon_deflate_vq, NULL)) == NULL) {
+	c = virtqueue_dequeue(sc->vtballoon_deflate_vq, NULL);
+	if (c == NULL) {
 		goto ret;
 	}
 
